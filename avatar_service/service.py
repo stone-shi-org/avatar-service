@@ -95,6 +95,8 @@ class Session:
     last_used: float = field(default_factory=time.time)
     connection_state: str = "new"
     video_track: object = None
+    feed: object = None                  # TurnFeed of the turn being rendered
+    turn_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def public(self) -> dict:
         return {"session_id": self.id, "avatar": self.avatar.id, "voice": self.voice,
@@ -176,7 +178,8 @@ class AvatarService:
         if av is None:
             raise ServiceError(404, "unknown_avatar", f"unknown avatar {aid!r}; have {list(self.catalog)}")
         sid = "ses_" + secrets.token_hex(8)
-        sess = Session(sid, av, voice or av.voice, load_portrait(av.image), Timeline())
+        sess = Session(sid, av, voice or av.voice, load_portrait(av.image),
+                       Timeline(preroll=self.s.preroll_frames, trim_lead=self.s.trim_lead_silence))
         sess.timeline.on_event = lambda e, s=sess: self._send_event(s, e)
         self.sessions[sid] = sess
         return sess
@@ -192,7 +195,7 @@ class AvatarService:
         sess = self.sessions.pop(sid, None)
         if sess is None:
             raise ServiceError(404, "unknown_session", "unknown session")
-        sess.timeline.stop()
+        self.stop(sess)
         if sess.pc is not None:
             await sess.pc.close()
 
@@ -202,7 +205,7 @@ class AvatarService:
             dead = sess.connection_state in ("failed", "closed")
             if dead or now - sess.last_used > self.s.session_idle_timeout_s:
                 self.sessions.pop(sid, None)
-                sess.timeline.stop()
+                self.stop(sess)
                 if sess.pc is not None and self.loop:
                     self.loop.create_task(sess.pc.close())
 
@@ -221,36 +224,70 @@ class AvatarService:
             raise ServiceError(409, "busy", "another session is speaking; try again or fall back")
 
     def speak(self, sess: Session, audio: np.ndarray, sr: int, text: str, tts_ms: int, emo: Optional[int]) -> Utterance:
-        """Queue rendering of `audio` (float32 mono, any rate). Returns at once; frames stream as they render."""
+        """Queue `audio` (float32 mono, any rate) on the session's current speaking turn. Returns at once.
+
+        All sentences of a turn go through one continuous Ditto stream (see DittoRenderer.stream), so only the
+        first pays the renderer's start-up and the rest follow without gaps.
+        """
+        from .ditto_engine import TurnFeed
+
         if len(audio) / sr > self.s.max_audio_seconds:
             raise ServiceError(413, "audio_too_long", f"at most {self.s.max_audio_seconds} s per utterance")
-        a48 = to_int16(resample(audio, sr, OUT_SR))
-        utt = Utterance(text=text, audio48=a48, lead_silence_ms=lead_silence_ms(resample(audio, sr, OUT_SR), OUT_SR),
-                        tts_ms=tts_ms)
+        a48f = resample(audio, sr, OUT_SR)
+        utt = Utterance(text=text, audio48=to_int16(a48f), lead_silence_ms=lead_silence_ms(a48f, OUT_SR), tts_ms=tts_ms)
         a16 = resample(audio, sr, DITTO_SR)
-        tl, loop = sess.timeline, self.loop
-        tl.add(utt)
-
-        def on_frame(img):
-            h, w = img.shape[:2]
-            utt.frames.append((utt.rendered, img[: h - h % 2, : w - w % 2]))
-            utt.rendered += 1
-            loop.call_soon_threadsafe(tl.frame_ready, utt)
-
-        def job():
-            if utt.cancelled:
-                return 0
-            return self.renderer.render(sess.avatar, a16, on_frame, cancelled=lambda: utt.cancelled, emo=emo)
-
-        fut = self.pool.submit(job)
-
-        def done(f):
-            try:
-                n = f.result()
-            except Exception:  # noqa: BLE001
-                log.exception("render failed for utterance %s", utt.id)
-                n = utt.rendered
-            loop.call_soon_threadsafe(tl.finish, utt, n)
-
-        fut.add_done_callback(done)
+        sess.timeline.add(utt)
+        with sess.turn_lock:
+            if sess.feed is not None and sess.feed.put((utt, a16)):
+                return utt                       # appended to the running stream
+            feed = sess.feed = TurnFeed()
+            feed.put((utt, a16))
+        self.pool.submit(self._run_turn, sess, feed, emo)
         return utt
+
+    def _run_turn(self, sess: Session, feed, emo: Optional[int]) -> None:
+        tl, loop = sess.timeline, self.loop
+        segs: list[list] = []                    # [first_frame, n_frames, utt, done]
+
+        def on_segment(utt, first, n):
+            segs.append([first, n, utt, False])
+
+        def on_frame(g, img):
+            for seg in segs:
+                first, n, utt, done = seg
+                if first <= g < first + n:
+                    if utt.cancelled:
+                        return
+                    h, w = img.shape[:2]
+                    utt.frames.append((g - first, img[: h - h % 2, : w - w % 2]))
+                    utt.rendered += 1
+                    loop.call_soon_threadsafe(tl.frame_ready, utt)
+                    if g == first + n - 1:
+                        seg[3] = True
+                        loop.call_soon_threadsafe(tl.finish, utt, n)
+                    return
+            # frames of the flush silence between sentences belong to nobody
+
+        try:
+            if feed.cancelled:
+                return
+            self.renderer.stream(sess.avatar, feed, on_segment, on_frame, emo=emo)
+        except Exception:  # noqa: BLE001
+            log.exception("render stream failed for session %s", sess.id)
+        finally:
+            with sess.turn_lock:
+                if sess.feed is feed:
+                    sess.feed = None
+                for utt, _ in feed.cancel():     # anything still queued (only after an error)
+                    utt.cancelled = True
+            for first, n, utt, done in segs:
+                if not done:
+                    loop.call_soon_threadsafe(tl.finish, utt, utt.rendered)
+
+    def stop(self, sess: Session) -> list[int]:
+        """Barge-in: cancel the running stream and everything queued or playing."""
+        with sess.turn_lock:
+            if sess.feed is not None:
+                sess.feed.cancel()
+                sess.feed = None
+        return sess.timeline.stop()

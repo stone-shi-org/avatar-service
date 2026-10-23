@@ -29,7 +29,11 @@ def test_release_waits_for_preroll():
     feed(tl, u, 2)
     assert u.start_tick is None and not events
     feed(tl, u, 1)
-    assert u.start_tick == 1 and events[0]["type"] == "utterance_start"
+    assert u.start_tick == 1 and not events
+    tl.next_video(lambda t: IDLE)       # tick 0: still idle
+    assert not events
+    tl.next_video(lambda t: IDLE)       # tick 1: playback reaches the utterance
+    assert events[0]["type"] == "utterance_start" and events[0]["start_ms"] == 40
     # audio for the utterance starts exactly at its start tick
     assert sum(len(a) for a in tl.audio_q) == (u.start_tick * SAMPLES_PER_FRAME) + len(u.audio48)
 
@@ -50,14 +54,14 @@ def test_video_follows_audio_clock_dropping_late_and_holding_missing():
     assert f[0, 0, 0] == frame(3)[0, 0, 0]
 
 
-def test_finish_pads_audio_to_video_length_and_ends():
+def test_finish_ends_with_the_audio_and_drops_surplus_frames():
     events = []
     tl = Timeline(preroll=1, on_event=events.append)
     u = utt(5)
     tl.add(u)
-    feed(tl, u, 7)                      # Ditto produced 2 more frames than the audio covers
+    feed(tl, u, 7)                      # Ditto produced 2 more (silent) frames than the audio covers
     tl.finish(u, 7)
-    assert u.end_tick == u.start_tick + 7
+    assert u.end_tick == u.start_tick + 5
     assert tl.audio_queued_end == u.end_tick * SAMPLES_PER_FRAME
     for _ in range(u.end_tick + 1):
         tl.next_video(lambda t: IDLE)
@@ -94,3 +98,67 @@ def test_audio_pull_is_exact_length():
     assert len(tl.next_audio(960)) == 960
     rest = tl.next_audio(960)
     assert rest[:40].all() and not rest[40:].any()
+
+
+def test_finish_pads_partial_last_frame_of_audio():
+    tl = Timeline(preroll=1)
+    u = Utterance(text="hi", audio48=np.ones(4 * SAMPLES_PER_FRAME + 100, np.int16))  # 4.05 frames of audio
+    tl.add(u)
+    feed(tl, u, 3)                      # fewer frames than the audio needs: video holds the last one
+    tl.finish(u, 3)
+    assert u.end_tick == u.start_tick + 5
+    assert tl.audio_queued_end == u.end_tick * SAMPLES_PER_FRAME
+
+
+def test_leading_silence_is_trimmed_and_frames_stay_in_sync():
+    events = []
+    tl = Timeline(preroll=2, on_event=events.append)
+    u = utt(20)
+    u.lead_silence_ms = 300                       # 7 whole frames of silence -> skip 7 - 3 = 4 frames
+    tl.add(u)
+    feed(tl, u, 10)                               # released at tick 0: playback starts at tick 1
+    assert u.trim_frames == 4 and u.start_tick == 1 - 4
+    # one frame of alignment silence, then the audio from frame 4 on
+    assert sum(len(a) for a in tl.audio_q) == SAMPLES_PER_FRAME + (20 - 4) * SAMPLES_PER_FRAME
+    assert tl.next_video(lambda t: IDLE) is IDLE and not events     # tick 0: idle, trimmed frames never shown
+    f = tl.next_video(lambda t: IDLE)                               # tick 1: frame 4, with frame 4's audio
+    assert f[0, 0, 0] == frame(4)[0, 0, 0]
+    assert events[0]["type"] == "utterance_start" and events[0]["start_ms"] == 40
+    tl.finish(u, 20)
+    assert u.end_tick == u.start_tick + 20 and tl.audio_queued_end == u.end_tick * SAMPLES_PER_FRAME
+
+
+def test_trim_can_be_disabled():
+    tl = Timeline(preroll=1, trim_lead=False)
+    u = utt(10)
+    u.lead_silence_ms = 300
+    tl.add(u)
+    feed(tl, u, 1)
+    assert u.trim_frames == 0 and u.start_tick == 1
+
+
+def test_queued_sentence_keeps_its_pause_and_starts_after_one_frame():
+    tl = Timeline(preroll=8)
+    a, b = utt(10), utt(20)
+    b.lead_silence_ms = 300                       # 7 frames of lead-in silence
+    tl.add(a)
+    tl.add(b)
+    feed(tl, a, 10)
+    tl.finish(a, 10)
+    feed(tl, b, 1)                                # one frame is enough: the first 7 are silent anyway
+    assert b.start_tick == a.end_tick and b.trim_frames == 0
+
+
+def test_turn_feed_never_loses_a_sentence():
+    from avatar_service.ditto_engine import TurnFeed
+    f = TurnFeed()
+    assert f.put("a") and f.next(0) == "a"
+    assert f.next(0.01) is None
+    assert f.close_if_empty()            # stream ends...
+    assert not f.put("b")                # ...so the caller must start a new stream
+    g = TurnFeed()
+    g.put("x")
+    assert not g.close_if_empty()        # a sentence arrived in time: stream must go on
+    assert g.next(0) == "x"
+    g.put("y")
+    assert g.cancel() == ["y"] and g.next(0) is None and not g.put("z")

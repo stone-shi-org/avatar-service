@@ -24,6 +24,7 @@ import numpy as np
 from .audio import FPS, SAMPLES_PER_FRAME
 
 _ids = itertools.count(1)
+KEEP_LEAD_FRAMES = 3   # keep 120 ms of a sentence's leading silence
 
 
 @dataclass
@@ -38,6 +39,8 @@ class Utterance:
     start_tick: Optional[int] = None
     end_tick: Optional[int] = None    # known once rendering is done
     cancelled: bool = False
+    started: bool = False             # utterance_start sent (playback reached start_tick)
+    trim_frames: int = 0              # leading-silence frames skipped at release
     t_created: float = field(default_factory=time.time)
     t_first_frame: Optional[float] = None
     t_released: Optional[float] = None
@@ -52,14 +55,16 @@ class Utterance:
         return {"id": self.id, "text": self.text[:80], "tts_ms": self.tts_ms, "lead_silence_ms": self.lead_silence_ms,
                 "audio_ms": round(len(self.audio48) / 48), "frames": self.rendered,
                 "first_frame_ms": ms(self.t_first_frame), "released_ms": ms(self.t_released), "rendered_ms": ms(self.t_done),
-                "start_tick": self.start_tick, "end_tick": self.end_tick, "cancelled": self.cancelled}
+                "trimmed_ms": self.trim_frames * 40, "start_tick": self.start_tick, "end_tick": self.end_tick,
+                "cancelled": self.cancelled}
 
 
 class Timeline:
     """Owned by the asyncio loop thread; the renderer thread only appends to `Utterance.frames`."""
 
-    def __init__(self, preroll: int = 8, on_event: Callable[[dict], None] = lambda e: None):
+    def __init__(self, preroll: int = 8, on_event: Callable[[dict], None] = lambda e: None, trim_lead: bool = True):
         self.preroll = preroll
+        self.trim_lead = trim_lead
         self.on_event = on_event
         self.tick = 0                    # next video tick to be shown
         self.audio_q: "collections.deque[np.ndarray]" = collections.deque()
@@ -80,15 +85,35 @@ class Timeline:
         self.utts.append(utt)
 
     # ---- renderer side (called on the loop thread via call_soon_threadsafe) ----
+    def _plan(self, utt: Utterance) -> tuple[int, int]:
+        """(frames of leading silence to skip, frames to pre-render before releasing the audio).
+
+        TTS sentences start with ~300 ms of silence (Kokoro). For the first sentence of a turn all but
+        KEEP_LEAD_FRAMES of it is skipped (its audio isn't queued, its closed-mouth frames are dropped as late),
+        so the first word comes sooner. Queued sentences keep it: it is the natural pause between sentences.
+        Leading silence also counts toward the pre-roll: a stall while the mouth is closed is invisible, so a
+        queued sentence can start right after its first frame instead of waiting for the full pre-roll.
+        """
+        lead = utt.lead_silence_ms // 40
+        fresh = not self.utts or self.utts[0] is utt
+        trim = max(0, lead - KEEP_LEAD_FRAMES) if (fresh and self.trim_lead) else 0
+        trim = min(trim, max(0, utt.audio_frames - 1))
+        return trim, max(1, self.preroll - (lead - trim))
+
     def frame_ready(self, utt: Utterance) -> None:
         if utt.t_first_frame is None:
             utt.t_first_frame = time.time()
-        if utt.start_tick is None and not utt.cancelled and utt.rendered >= self.preroll:
-            self.release(utt)
+        if utt.start_tick is None and not utt.cancelled:
+            trim, needed = self._plan(utt)
+            if utt.rendered >= needed:
+                self.release(utt, trim)
 
-    def release(self, utt: Utterance) -> None:
+    def release(self, utt: Utterance, trim: int | None = None) -> None:
+        """Queue the utterance's audio and fix its place on the timeline (see `_plan`)."""
         if utt.start_tick is not None or utt.cancelled:
             return
+        if trim is None:
+            trim = self._plan(utt)[0]
         with self.lock:
             cur = max(self.audio_emitted, self.audio_queued_end)
             start = max(self.tick + 1, math.ceil(cur / SAMPLES_PER_FRAME))
@@ -102,15 +127,21 @@ class Timeline:
             gap = start * SAMPLES_PER_FRAME - cur
             if gap > 0:
                 self.audio_q.append(np.zeros(gap, np.int16))
-            self.audio_q.append(utt.audio48)
-            self.audio_queued_end = start * SAMPLES_PER_FRAME + len(utt.audio48)
-            utt.start_tick = start
+            audio = utt.audio48[trim * SAMPLES_PER_FRAME:]
+            self.audio_q.append(audio)
+            self.audio_queued_end = start * SAMPLES_PER_FRAME + len(audio)
+            # frame `trim` plays at tick `start`; frames before it are dropped by next_video as late
+            utt.trim_frames = trim
+            utt.start_tick = start - trim
             utt.t_released = time.time()
-        self.on_event({"type": "utterance_start", "id": utt.id, "text": utt.text, "start_ms": start * 40,
-                       "lead_silence_ms": utt.lead_silence_ms, "audio_ms": round(len(utt.audio48) / 48)})
 
     def finish(self, utt: Utterance, frames: int) -> None:
-        """Rendering is done: make audio and video exactly the same length."""
+        """Rendering is done: the utterance lasts exactly as long as its audio.
+
+        Ditto renders a few closed-mouth frames past the end of the audio (its last chunk is padded); those are
+        dropped rather than stretching the utterance, so back-to-back sentences don't get a gap. If it rendered
+        fewer frames than the audio needs, the video track holds the last frame.
+        """
         utt.t_done = time.time()
         if utt.cancelled:
             return
@@ -119,7 +150,7 @@ class Timeline:
                 self._drop(utt)
                 return
             self.release(utt)
-        total = max(frames, utt.audio_frames)
+        total = utt.audio_frames
         with self.lock:
             pad = total * SAMPLES_PER_FRAME - len(utt.audio48)
             if pad > 0:
@@ -157,11 +188,17 @@ class Timeline:
         while self.utts and self.utts[0].end_tick is not None and t >= self.utts[0].end_tick:
             self._drop(self.utts[0])
         u = self.utts[0] if self.utts else None
-        if u is None or u.start_tick is None or t < u.start_tick:
+        if u is None or u.start_tick is None or t < u.start_tick + u.trim_frames:
             f = idle(t)
             if f is not None:
                 self.last_frame = f
             return self.last_frame
+        if not u.started:                    # playback reaches this utterance now
+            u.started = True
+            self.on_event({"type": "utterance_start", "id": u.id, "text": u.text,
+                           "start_ms": (u.start_tick + u.trim_frames) * 40,
+                           "lead_silence_ms": max(0, u.lead_silence_ms - u.trim_frames * 40),
+                           "audio_ms": round(len(u.audio48) / 48) - u.trim_frames * 40})
         want = t - u.start_tick
         frame = None
         while u.frames and u.frames[0][0] < want:

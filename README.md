@@ -62,18 +62,24 @@ Every `/v1/*` call needs `Authorization: Bearer <AVATAR_API_TOKEN>` when that va
 | `GET /v1/sessions/{id}` | | state + per-utterance timings |
 | `DELETE /v1/sessions/{id}` | | close |
 
-**Sentences** posted one after another are queued and play back to back.
+**Sentences** posted one after another are queued and play back to back. All sentences of a turn go through one
+continuous Ditto stream, so only the first pays the renderer's start-up (about 430 ms to the first frame on an
+RTX 3090; the next turn after switching to a *different* avatar adds 150–600 ms). `emo` applies per turn: it is
+read when a turn starts.
 
 **Data channel events.** If the offer creates a data channel (any label), the service sends JSON events:
 
-- `{"type": "utterance_start", "id", "text", "start_ms", "lead_silence_ms", "audio_ms"}` when the voice for an utterance starts;
+- `{"type": "utterance_start", "id", "text", "start_ms", "lead_silence_ms", "audio_ms"}` when playback reaches the utterance (its first frame and first audio sample);
 - `{"type": "utterance_end", "id", "cancelled"}` when it has finished (or was stopped).
 
 Use these for captions and turn-taking.
 
 **Sync.** Audio for an utterance is released once 8 frames are pre-rendered (`start_ms` on the shared media clock).
 The video track then always shows the frame that belongs to the audio position: late frames are dropped and missing
-ones hold the previous frame, so lips never drift behind the voice. Measured skew in Chrome was −34…+60 ms.
+ones hold the previous frame, so lips never drift behind the voice. Measured skew in Chrome was −34…+60 ms. TTS sentences usually start with ~300 ms of
+silence. For the first sentence of a turn all but 120 ms of it is skipped (audio and the matching closed-mouth
+frames), so the first word comes sooner. Queued sentences keep it as the pause between sentences, and since a stall
+while the mouth is closed is invisible, they start right after their first rendered frame.
 
 ### Browser notes
 
@@ -96,6 +102,8 @@ ones hold the previous frame, so lips never drift behind the voice. Measured ske
 | `AVATAR_SESSION_IDLE_TIMEOUT_S` | `900` | sessions without API calls are closed |
 | `AVATAR_IDLE_LOOP_SECONDS` | `8` | length of the pre-rendered idle loop (played ping-pong) |
 | `AVATAR_SAMPLING_STEPS` | `10` | Ditto motion-diffusion steps (5 is a little faster, with more startup jitter) |
+| `AVATAR_PREROLL_FRAMES` | `8` | frames rendered before an utterance's audio is released (stall-free start) |
+| `AVATAR_TRIM_LEAD_SILENCE` | `1` | skip all but 120 ms of the leading TTS silence of the first sentence of a turn (sooner first word) |
 | `AVATAR_NATIVE_ENGINES` | `1` | `0` = use the shipped Ampere+ engines as they are (slower) |
 | `AVATAR_ICE_SERVERS` | | e.g. `stun:stun.l.google.com:19302,turn:...` |
 | `AVATAR_MAX_TEXT_CHARS` / `AVATAR_MAX_AUDIO_SECONDS` | `1000` / `30` | per utterance |

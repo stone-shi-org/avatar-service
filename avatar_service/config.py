@@ -37,6 +37,10 @@ class Settings:
     idle_loop_seconds: int = field(default_factory=lambda: _int("AVATAR_IDLE_LOOP_SECONDS", 8))
     # diffusion steps of Ditto's motion model (online config default: 10)
     sampling_steps: int = field(default_factory=lambda: _int("AVATAR_SAMPLING_STEPS", 10))
+    # frames rendered before an utterance's audio is released (stall-free start; ~330 ms on an RTX 3090)
+    preroll_frames: int = field(default_factory=lambda: _int("AVATAR_PREROLL_FRAMES", 8))
+    # skip all but 120 ms of the leading TTS silence of a turn's first sentence (sooner first word)
+    trim_lead_silence: bool = field(default_factory=lambda: os.environ.get("AVATAR_TRIM_LEAD_SILENCE", "1") != "0")
     max_text_chars: int = field(default_factory=lambda: _int("AVATAR_MAX_TEXT_CHARS", 1000))
     max_audio_seconds: int = field(default_factory=lambda: _int("AVATAR_MAX_AUDIO_SECONDS", 30))
     # optional STUN/TURN for clients outside the LAN, e.g. "stun:stun.l.google.com:19302"

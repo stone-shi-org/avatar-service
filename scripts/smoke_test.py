@@ -161,6 +161,21 @@ async def main(a) -> int:
             _, sess = await c.api("GET", f"/v1/sessions/{c.sid}")
             report["utterance_stats"] = sess["utterances"][-1] if sess["utterances"] else None
 
+            # two sentences posted back to back must play with no gap (the app sends one sentence at a time)
+            _, ra = await c.api("POST", f"/v1/sessions/{c.sid}/say", {"text": "That's interesting."})
+            _, rb = await c.api("POST", f"/v1/sessions/{c.sid}/say", {"text": "What would you do differently next time?"})
+            for _ in range(int(a.timeout * 10)):
+                if any(e["type"] == "utterance_end" and e["id"] == rb["utterance_id"] for e in c.events):
+                    break
+                await asyncio.sleep(0.1)
+            a_end = next((e for e in c.events if e["type"] == "utterance_end" and e["id"] == ra["utterance_id"]), None)
+            b_start = next((e for e in c.events if e["type"] == "utterance_start" and e["id"] == rb["utterance_id"]), None)
+            if a_end and b_start:
+                report["back_to_back_gap_ms"] = round((b_start["t"] - a_end["t"]) * 1000)
+                checks["back_to_back_no_gap"] = report["back_to_back_gap_ms"] < 200
+            else:
+                checks["back_to_back_no_gap"] = False
+
             # barge-in: start a long line and stop it
             _, r2 = await c.api("POST", f"/v1/sessions/{c.sid}/say", {"text": a.long_text})
             await asyncio.sleep(1.5)

@@ -124,7 +124,7 @@ async def offer(request):
         sess.connection_state = pc.connectionState
         log.info("session %s: %s", sess.id, pc.connectionState)
         if pc.connectionState in ("failed", "closed"):
-            sess.timeline.stop()
+            svc.stop(sess)
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=body["sdp"], type="offer"))
     # attach after the offer so each track lands on the client's matching recvonly transceiver;
@@ -175,8 +175,8 @@ async def say(request):
 
 
 async def stop(request):
-    sess = request.app[SVC].get(request.match_info["sid"])
-    return web.json_response({"cancelled": sess.timeline.stop()})
+    svc = request.app[SVC]
+    return web.json_response({"cancelled": svc.stop(svc.get(request.match_info["sid"]))})
 
 
 def build_app(settings: Settings | None = None, service: AvatarService | None = None) -> web.Application:

@@ -5,7 +5,9 @@ called from one thread at a time; `Renderer` serialises with a lock.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
+import copy
 import io
 import logging
 import math
@@ -19,10 +21,78 @@ import numpy as np
 
 from .audio import DITTO_SR, FPS
 from .avatars import Avatar
+from .gestures import IdleAssets, pick_anchors, pose_cost
 
 log = logging.getLogger("avatar.ditto")
 
 CHUNK = (3, 5, 2)  # HuBERT streaming chunk: 3 past, 5 current, 2 future frames (Ditto's online default)
+
+
+# Ditto's motion is LivePortrait's: 21 implicit 3D keypoints; `exp` (1, 63) is a per-keypoint expression offset.
+# For a portrait, MotionStitch takes `exp` from the audio->motion model only for these lip keypoints (and the eye
+# ones); everything else stays at the source image (core/atomic_components/motion_stitch.py, `_lip` / `_eye`).
+LIP_KP = (6, 12, 14, 17, 19, 20)
+LIP_DIMS = np.array([3 * k + c for k in LIP_KP for c in range(3)])
+
+
+def patch_motion_stitch(ms) -> None:
+    """Give Ditto's MotionStitch instance extra per-frame controls (passed like Ditto's own `ctrl_info` kwargs).
+
+    - `mouth_alpha`: scales the lip keypoints' motion relative to the stream's first frame `d0`. Ditto drives
+      a portrait *relative* to d0 (x_s + (x_d - d0)), so 0 holds the lips exactly at the source image's
+      (closed) mouth and 1 leaves the model's prediction untouched. Default: `ms.mouth_alpha` (1.0).
+    - `add_pitch` / `add_yaw` / `add_roll` (degrees): added to the cfg's own `delta_*` (the online cfg sets
+      `overall_ctrl_info = {"delta_pitch": 2}`; passing `delta_pitch` per frame would *replace* that).
+    - `add_exp` (1, 63): added to the final expression (Ditto's `delta_exp`).
+    - `eye_idx`: position in Ditto's scripted blink plan for this frame (re-rendering recorded frames).
+    If `ms.recorder` is a list, every incoming (raw) motion frame is appended to it with its blink index.
+    """
+    base = type(ms)
+    if getattr(base, "_avatar_patched", False):
+        return
+
+    class PatchedMotionStitch(base):
+        _avatar_patched = True
+        mouth_alpha = 1.0
+        recorder = None
+
+        def __call__(self, x_s_info, x_d_info, **kw):
+            alpha = kw.pop("mouth_alpha", self.mouth_alpha)
+            if "eye_idx" in kw:
+                self.idx = kw.pop("eye_idx")
+            overall = self.overall_ctrl_info or {}
+            # plain floats / the motion's own dtype: a float64 here would turn the keypoints into float64, which
+            # the TensorRT engines would read as garbage (and PyTorch rejects)
+            for k in ("pitch", "yaw", "roll"):
+                if f"add_{k}" in kw:
+                    kw[f"delta_{k}"] = float(kw.get(f"delta_{k}", overall.get(f"delta_{k}", 0)) + kw.pop(f"add_{k}"))
+            if "add_exp" in kw:
+                kw["delta_exp"] = np.asarray(kw.pop("add_exp"), dtype=x_d_info["exp"].dtype).reshape(x_d_info["exp"].shape)
+            if self.recorder is not None:
+                self.recorder.append((copy.deepcopy(x_d_info), self.idx))
+            if alpha < 1 and self.d0 is not None:
+                exp = x_d_info["exp"].copy()
+                d0 = self.d0["exp"].reshape(exp.shape)
+                exp[:, LIP_DIMS] = d0[:, LIP_DIMS] + (exp[:, LIP_DIMS] - d0[:, LIP_DIMS]) * alpha
+                x_d_info = {**x_d_info, "exp": exp}
+            return super().__call__(x_s_info, x_d_info, **kw)
+
+    ms.__class__ = PatchedMotionStitch
+
+
+def _degrees(bins: np.ndarray) -> float:
+    """Ditto pose logits (66 bins of 3 degrees) -> degrees (same as motion_stitch.bin66_to_degree)."""
+    x = np.asarray(bins, np.float64).reshape(-1)
+    if x.size != 66:
+        return float(x[0])
+    e = np.exp(x - x.max())
+    return float((e / e.sum() * np.arange(66)).sum() * 3 - 97.5)
+
+
+def motion_poses(motion: list) -> np.ndarray:
+    """(N, 5) pitch, yaw, roll (degrees), tx, ty of recorded raw motion frames."""
+    return np.array([[_degrees(d["pitch"]), _degrees(d["yaw"]), _degrees(d["roll"]),
+                      float(d["t"].reshape(-1)[0]), float(d["t"].reshape(-1)[1])] for d, _ in motion])
 
 
 class _NullWriter:
@@ -108,39 +178,43 @@ class DittoRenderer:
             return self._registered[src]
 
         self.sdk.avatar_registrar = cached
+        patch_motion_stitch(self.sdk.motion_stitch)
 
     def render(self, avatar: Avatar, audio16k: np.ndarray, on_frame: Callable[[np.ndarray], None],
                cancelled: Callable[[], bool] = lambda: False, emo: int | None = None) -> int:
         """Render `audio16k` (float32 mono 16 kHz) as fast as the GPU allows; returns the frame count."""
         with self.lock:
-            sdk = self.sdk
-            count = [0]
+            return self._render(avatar, audio16k, on_frame, cancelled, emo)
 
-            def emit(img):
+    def _render(self, avatar, audio16k, on_frame, cancelled=lambda: False, emo=None) -> int:
+        sdk = self.sdk
+        count = [0]
+
+        def emit(img):
+            if cancelled():
+                return
+            count[0] += 1
+            on_frame(np.ascontiguousarray(img))
+
+        kw = dict(online_mode=True, sampling_timesteps=self.steps, emo=avatar.emo if emo is None else emo)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sdk.setup(avatar.image, "/tmp/avatar-unused.mp4", **kw)
+        sdk.writer_pbar.disable = True
+        sdk.writer.cb = emit
+        sdk.setup_Nd(N_d=math.ceil(len(audio16k) / DITTO_SR * FPS))
+        a = np.concatenate([np.zeros(CHUNK[0] * 640, np.float32), audio16k.astype(np.float32)])
+        split = int(sum(CHUNK) * 0.04 * DITTO_SR) + 80
+        try:
+            for i in range(0, len(a), CHUNK[1] * 640):
                 if cancelled():
-                    return
-                count[0] += 1
-                on_frame(np.ascontiguousarray(img))
-
-            kw = dict(online_mode=True, sampling_timesteps=self.steps, emo=avatar.emo if emo is None else emo)
-            with contextlib.redirect_stdout(io.StringIO()):
-                sdk.setup(avatar.image, "/tmp/avatar-unused.mp4", **kw)
-            sdk.writer_pbar.disable = True
-            sdk.writer.cb = emit
-            sdk.setup_Nd(N_d=math.ceil(len(audio16k) / DITTO_SR * FPS))
-            a = np.concatenate([np.zeros(CHUNK[0] * 640, np.float32), audio16k.astype(np.float32)])
-            split = int(sum(CHUNK) * 0.04 * DITTO_SR) + 80
-            try:
-                for i in range(0, len(a), CHUNK[1] * 640):
-                    if cancelled():
-                        break
-                    ch = a[i:i + split]
-                    if len(ch) < split:
-                        ch = np.pad(ch, (0, split - len(ch)))
-                    sdk.run_chunk(ch, CHUNK)
-            finally:
-                sdk.close()
-            return count[0]
+                    break
+                ch = a[i:i + split]
+                if len(ch) < split:
+                    ch = np.pad(ch, (0, split - len(ch)))
+                sdk.run_chunk(ch, CHUNK)
+        finally:
+            sdk.close()
+        return count[0]
 
     def stream(self, avatar: Avatar, feed: TurnFeed, on_segment: Callable[[object, int, int], None],
                on_frame: Callable[[int, np.ndarray], None], emo: int | None = None, linger_s: float = 1.0) -> None:
@@ -207,13 +281,60 @@ class DittoRenderer:
             finally:
                 sdk.close()
 
-    def render_idle(self, avatar: Avatar, seconds: int) -> list[np.ndarray]:
-        """Idle loop: the portrait animated over near-silence (blinks, slight head motion)."""
+    def render_idle(self, avatar: Avatar, seconds: int, still_mouth: bool = True,
+                    clips: dict[str, list[dict]] | None = None, anchors: int = 2) -> IdleAssets:
+        """Idle loop: the portrait animated over near-silence (blinks, slight head motion), plus gesture clips.
+
+        Ditto's audio->motion model still predicts small lip movements from silence, so with `still_mouth` the
+        lips are held at the portrait's own closed mouth (`mouth_alpha=0`); blinks and head sway are untouched.
+
+        `clips` ({name: per-frame ctrl dicts}) are re-rendered from the idle loop's own recorded motion, starting
+        at each of `anchors` splice frames, with the gesture's controls on top. Controls are zero at both ends, so
+        a clip starts on exactly its anchor frame and ends on exactly the idle frame it was cut up to.
+        """
         rng = np.random.default_rng(1)
         noise = (rng.normal(0, 30, DITTO_SR * seconds) / 32768.0).astype(np.float32)
         frames: list[np.ndarray] = []
-        self.render(avatar, noise, frames.append)
-        return frames
+        with self.lock:
+            ms = self.sdk.motion_stitch
+            ms.mouth_alpha, ms.recorder = (0.0 if still_mouth else 1.0), []
+            try:
+                self._render(avatar, noise, frames.append)
+                motion = ms.recorder
+            finally:
+                ms.mouth_alpha, ms.recorder = 1.0, None
+            out = IdleAssets(frames)
+            if not clips:
+                return out
+            if len(motion) != len(frames):
+                log.warning("idle motion not recorded (%d vs %d frames): no gesture clips", len(motion), len(frames))
+                return out
+            eye_plan = getattr(ms, "delta_eye_idx_list", None) if ms.drive_eye and ms.delta_eye_arr is not None else None
+            blink = np.array([bool(eye_plan[i % len(eye_plan)]) if eye_plan else False for _, i in motion])
+            poses = motion_poses(motion)
+            out.anchors = pick_anchors(poses, blink, anchors, max(len(c) for c in clips.values()))
+            out.cost = pose_cost(poses, blink, out.anchors).astype(np.float32)
+            base = {"mouth_alpha": 0.0 if still_mouth else 1.0}
+            for name, ctrls in clips.items():
+                out.clips[name] = [self.render_motion(motion[a:a + len(ctrls)], [{**base, **c} for c in ctrls])
+                                   for a in out.anchors]
+            return out
+
+    def render_motion(self, motion: list, ctrls: list[dict]) -> list[np.ndarray]:
+        """Re-render recorded motion frames synchronously (stitch -> warp -> decode -> paste back), with per-frame
+        controls. Must run right after a render of the same avatar (uses the SDK's source info and d0)."""
+        sdk = self.sdk
+        src = sdk.source_info
+        x_s_info, f_s, img, m_c2o = src["x_s_info_lst"][0], src["f_s_lst"][0], src["img_rgb_lst"][0], src["M_c2o_lst"][0]
+        # GPU stages here, the CPU paste-back (cv2 warp + blend at full size) overlapped in a second thread;
+        # decode_f3d returns a fresh array, so the next frame can't overwrite it
+        with concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="putback") as pool:
+            futs = []
+            for (x_d_info, eye_idx), ctrl in zip(motion, ctrls):
+                x_s, x_d = sdk.motion_stitch(x_s_info, copy.deepcopy(x_d_info), eye_idx=eye_idx, **ctrl)
+                render = sdk.decode_f3d(sdk.warp_f3d(f_s, x_s, x_d))
+                futs.append(pool.submit(sdk.putback, img, render, m_c2o))
+            return [np.ascontiguousarray(f.result()) for f in futs]
 
 
 class FakeRenderer:
@@ -265,7 +386,16 @@ class FakeRenderer:
                 self._frames(avatar, a16, emit, lambda: feed.cancelled)
                 g += n
 
-    def render_idle(self, avatar, seconds):
+    def render_idle(self, avatar, seconds, still_mouth=True, clips=None, anchors=2):
         frames: list[np.ndarray] = []
         self.render(avatar, np.zeros(DITTO_SR, np.float32), frames.append)
-        return frames
+        out = IdleAssets(frames)
+        if clips:
+            n = len(frames)
+            out.anchors = [0]
+            out.cost = np.zeros((1, n), np.float32)
+            for name, ctrls in clips.items():   # the portrait with a coloured bar on the right, per clip
+                f = frames[0].copy()
+                f[:, -16:] = (40 * (1 + list(clips).index(name)) % 256, 200, 80)
+                out.clips[name] = [[f] * min(len(ctrls), n - 1)]
+        return out

@@ -88,3 +88,51 @@ def test_auth_required(tmp_path):
         finally:
             await runner.cleanup()
     asyncio.run(go())
+
+
+def test_state_endpoint(tmp_path):
+    async def go():
+        import aiohttp
+        av = tmp_path / "models" / "avatars"
+        av.mkdir(parents=True)
+        cv2.imwrite(str(av / "alexa.png"), np.full((360, 640, 3), 120, np.uint8))
+        s = Settings()
+        s.models_dir, s.data_dir, s.fake_renderer, s.api_token = str(tmp_path / "models"), str(tmp_path / "data"), True, "k"
+        port = free_port()
+        runner = web.AppRunner(build_app(s))
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", port).start()
+        base, auth = f"http://127.0.0.1:{port}", {"Authorization": "Bearer k"}
+        try:
+            async with aiohttp.ClientSession() as h:
+                for _ in range(100):
+                    async with h.get(f"{base}/health") as r:
+                        if r.status == 200:
+                            break
+                    await asyncio.sleep(0.1)
+                async with h.post(f"{base}/v1/sessions", json={}, headers=auth) as r:
+                    sid = (await r.json())["session_id"]
+                url = f"{base}/v1/sessions/{sid}/state"
+                async with h.post(url, json={"state": "listening"}) as r:
+                    assert r.status == 401
+                async with h.post(f"{base}/v1/sessions/ses_nope/state", json={"state": "listening"}, headers=auth) as r:
+                    assert r.status == 404
+                for bad in ({"state": "dancing"}, {"state": 3}, {}):
+                    async with h.post(url, json=bad, headers=auth) as r:
+                        assert r.status == 400 and (await r.json())["error"]["code"] == "invalid_state"
+                async with h.post(url, data="nope", headers=auth) as r:
+                    assert r.status == 400
+                expect = {"listening": (None, "applied"), "backchannel": ("nod", "pending"), "probe": ("tilt", "pending"),
+                          "hint": ("smile", "pending"), "wrap_up": ("smile", "pending"),
+                          "silent_thinking": (None, "applied"), "paused": (None, "applied")}
+                for state, (clip, status) in expect.items():
+                    async with h.post(url, json={"state": state}, headers=auth) as r:
+                        body = await r.json()
+                        assert r.status == 200, body
+                        assert body["state"] == state and body["clip"] == clip and body["status"] == status
+                async with h.get(f"{base}/v1/sessions/{sid}", headers=auth) as r:
+                    g = (await r.json())["gesture"]
+                    assert g["mode"] == "paused" and g["clips"] == ["glance_down", "nod", "smile", "tilt"]
+        finally:
+            await runner.cleanup()
+    asyncio.run(go())

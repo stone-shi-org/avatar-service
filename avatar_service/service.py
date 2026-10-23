@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import pickle
+import re
 import secrets
 import threading
 import time
@@ -19,6 +20,7 @@ import numpy as np
 from .audio import DITTO_SR, OUT_SR, lead_silence_ms, resample, to_int16
 from .avatars import Avatar, load_catalog
 from .config import Settings
+from .gestures import STATES, Director, IdleAssets, clip_controls
 from .session import Timeline, Utterance
 
 log = logging.getLogger("avatar.service")
@@ -38,18 +40,37 @@ def load_portrait(path: str) -> np.ndarray:
     return np.ascontiguousarray(cv2.cvtColor(img[: h - h % 2, : w - w % 2], cv2.COLOR_BGR2RGB))  # even size for yuv420
 
 
-class IdleLoops:
-    """Pre-rendered idle animation per avatar (rendered once, cached on the data volume as JPEGs)."""
+def _jpg(f: np.ndarray) -> bytes:
+    return cv2.imencode(".jpg", cv2.cvtColor(f, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])[1].tobytes()
 
-    def __init__(self, data_dir: str, seconds: int):
+
+def _unjpg(j: bytes) -> np.ndarray:
+    return cv2.cvtColor(cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+
+
+def _even(f: np.ndarray) -> np.ndarray:
+    return f[: f.shape[0] - f.shape[0] % 2, : f.shape[1] - f.shape[1] % 2]
+
+
+class IdleLoops:
+    """Pre-rendered idle animation + gesture clips per avatar (rendered once, cached on the data volume as JPEGs)."""
+
+    VERSION = 2
+
+    def __init__(self, data_dir: str, seconds: int, still_mouth: bool = True, clips: Optional[dict] = None,
+                 anchors: int = 2):
         self.dir = os.path.join(data_dir, "idle")
         self.seconds = seconds
-        self.frames: dict[str, list[np.ndarray]] = {}
-        self.pending: set[str] = set()
+        self.still_mouth = still_mouth
+        self.clips = clips or {}            # name -> per-frame controls (gestures.clip_controls)
+        self.anchors = anchors
+        self.assets: dict[str, IdleAssets] = {}
         self.lock = threading.Lock()
 
     def _path(self, av: Avatar) -> str:
-        h = hashlib.sha1(open(av.image, "rb").read() + f"{self.seconds}:{av.emo}:v1".encode()).hexdigest()[:12]
+        spec = repr((self.VERSION, self.seconds, av.emo, self.still_mouth, self.anchors,
+                     sorted((k, repr(v)) for k, v in self.clips.items())))
+        h = hashlib.sha1(open(av.image, "rb").read() + spec.encode()).hexdigest()[:12]
         return os.path.join(self.dir, f"{av.id}-{h}.pkl")
 
     def load_cached(self, av: Avatar) -> bool:
@@ -57,29 +78,27 @@ class IdleLoops:
         if not os.path.isfile(p):
             return False
         with open(p, "rb") as f:
-            jpgs = pickle.load(f)   # written by us (below), on our own volume
-        self.frames[av.id] = [cv2.cvtColor(cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB) for j in jpgs]
+            d = pickle.load(f)   # written by us (below), on our own volume
+        self.assets[av.id] = IdleAssets([_unjpg(j) for j in d["frames"]],
+                                        {k: [[_unjpg(j) for j in v] for v in vs] for k, vs in d["clips"].items()},
+                                        list(d["anchors"]), d["cost"])
         return True
 
-    def store(self, av: Avatar, frames: list[np.ndarray]) -> None:
-        frames = [f[: f.shape[0] - f.shape[0] % 2, : f.shape[1] - f.shape[1] % 2] for f in frames]
-        self.frames[av.id] = frames
+    def store(self, av: Avatar, assets: IdleAssets) -> None:
+        assets.frames = [_even(f) for f in assets.frames]
+        assets.clips = {k: [[_even(f) for f in v] for v in vs] for k, vs in assets.clips.items()}
+        self.assets[av.id] = assets
         os.makedirs(self.dir, exist_ok=True)
-        jpgs = [cv2.imencode(".jpg", cv2.cvtColor(f, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])[1].tobytes() for f in frames]
-        tmp = self._path(av) + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump(jpgs, f)
-        os.replace(tmp, self._path(av))
-
-    def frame(self, avatar_id: str, tick: int) -> Optional[np.ndarray]:
-        fr = self.frames.get(avatar_id)
-        if not fr:
-            return None
-        n = len(fr)
-        if n == 1:
-            return fr[0]
-        k = tick % (2 * n - 2)           # ping-pong: seamless without a cross-fade
-        return fr[k if k < n else 2 * n - 2 - k]
+        d = {"frames": [_jpg(f) for f in assets.frames],
+             "clips": {k: [[_jpg(f) for f in v] for v in vs] for k, vs in assets.clips.items()},
+             "anchors": assets.anchors, "cost": assets.cost}
+        path = self._path(av)
+        with open(path + ".tmp", "wb") as f:
+            pickle.dump(d, f)
+        os.replace(path + ".tmp", path)
+        for fn in os.listdir(self.dir):     # older renders of this avatar (other settings / format)
+            if re.fullmatch(re.escape(av.id) + r"-[0-9a-f]{12}\.pkl", fn) and os.path.join(self.dir, fn) != path:
+                os.remove(os.path.join(self.dir, fn))
 
 
 @dataclass
@@ -96,6 +115,7 @@ class Session:
     connection_state: str = "new"
     video_track: object = None
     feed: object = None                  # TurnFeed of the turn being rendered
+    director: Optional[Director] = None  # idle loop + gestures
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def public(self) -> dict:
@@ -103,6 +123,7 @@ class Session:
                 "connection_state": self.connection_state, "speaking": self.timeline.busy,
                 "frame_size": [int(self.portrait.shape[1]), int(self.portrait.shape[0])],
                 "frames_sent": getattr(self.video_track, "frames_sent", 0),
+                "gesture": self.director.status() if self.director else None,
                 "utterances": [u.stats() for u in self.timeline.utts] + list(self.timeline.history)[-10:]}
 
 
@@ -115,7 +136,9 @@ class AvatarService:
         self.gpu: Optional[str] = None
         self.renderer = None
         self.catalog: dict[str, Avatar] = load_catalog(settings.avatars_dir)
-        self.idle = IdleLoops(settings.data_dir, settings.idle_loop_seconds)
+        clips = {c: clip_controls(c, settings.gesture_scale) for c in settings.gesture_clips} if settings.gestures else {}
+        self.idle = IdleLoops(settings.data_dir, settings.idle_loop_seconds, settings.still_mouth_idle, clips,
+                              settings.gesture_anchors)
         self.sessions: dict[str, Session] = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="render")
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -144,8 +167,12 @@ class AvatarService:
             for av in self.catalog.values():
                 if not self.idle.load_cached(av):
                     t = time.time()
-                    self.idle.store(av, self.renderer.render_idle(av, self.s.idle_loop_seconds))
-                    log.info("idle loop for %s rendered in %.1f s", av.id, time.time() - t)
+                    assets = self.renderer.render_idle(av, self.s.idle_loop_seconds, still_mouth=self.idle.still_mouth,
+                                                       clips=self.idle.clips, anchors=self.idle.anchors)
+                    self.idle.store(av, assets)
+                    log.info("idle loop for %s rendered in %.1f s (%d frames; clips %s at anchors %s)", av.id,
+                             time.time() - t, len(assets.frames),
+                             {k: assets.clip_len(k) for k in assets.clips}, assets.anchors)
             if self.catalog:  # first real render also warms the TensorRT contexts
                 av = next(iter(self.catalog.values()))
                 self.renderer.render(av, np.zeros(DITTO_SR, np.float32), lambda f: None)
@@ -181,6 +208,9 @@ class AvatarService:
         sess = Session(sid, av, voice or av.voice, load_portrait(av.image),
                        Timeline(preroll=self.s.preroll_frames, trim_lead=self.s.trim_lead_silence))
         sess.timeline.on_event = lambda e, s=sess: self._send_event(s, e)
+        sess.director = Director(self.idle.assets.get(av.id), busy=lambda tl=sess.timeline: tl.busy,
+                                 on_event=lambda e, s=sess: self._send_event(s, e),
+                                 listen_interval=(self.s.listen_gesture_min_s, self.s.listen_gesture_max_s))
         self.sessions[sid] = sess
         return sess
 
@@ -214,6 +244,13 @@ class AvatarService:
         if ch is not None and getattr(ch, "readyState", "") == "open":
             import json
             ch.send(json.dumps(event))
+
+    # ---------- listening gestures ----------
+    def set_state(self, sess: Session, state: object) -> dict:
+        """Client behaviour state -> idle gesture (see gestures.ONE_SHOT / MODES). Never touches speech."""
+        if not isinstance(state, str) or state not in STATES:
+            raise ServiceError(400, "invalid_state", f"state must be one of {list(STATES)}")
+        return sess.director.set_state(state)
 
     # ---------- speaking ----------
     def admit(self, sess: Session) -> None:

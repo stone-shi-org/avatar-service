@@ -112,7 +112,7 @@ async def offer(request):
     pc = RTCPeerConnection(cfg)
     sess.pc = pc
     clock = MediaClock()
-    video = AvatarVideoTrack(clock, sess.timeline, lambda t, a=sess.avatar.id: svc.idle.frame(a, t), sess.portrait)
+    video = AvatarVideoTrack(clock, sess.timeline, sess.director.frame, sess.portrait)
     sess.video_track = video
 
     @pc.on("datachannel")
@@ -174,6 +174,13 @@ async def say(request):
                               "lead_silence_ms": utt.lead_silence_ms}, status=202)
 
 
+async def set_state(request):
+    svc = request.app[SVC]
+    sess = svc.get(request.match_info["sid"])
+    body = await _json(request)
+    return web.json_response(svc.set_state(sess, body.get("state")))
+
+
 async def stop(request):
     svc = request.app[SVC]
     return web.json_response({"cancelled": svc.stop(svc.get(request.match_info["sid"]))})
@@ -202,5 +209,6 @@ def build_app(settings: Settings | None = None, service: AvatarService | None = 
         web.post("/v1/sessions", create_session), web.get("/v1/sessions/{sid}", get_session),
         web.delete("/v1/sessions/{sid}", delete_session), web.post("/v1/sessions/{sid}/offer", offer),
         web.post("/v1/sessions/{sid}/say", say), web.post("/v1/sessions/{sid}/stop", stop),
+        web.post("/v1/sessions/{sid}/state", set_state),
     ])
     return app

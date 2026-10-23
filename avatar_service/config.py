@@ -10,6 +10,11 @@ def _int(name: str, default: int) -> int:
     return int(v) if v else default
 
 
+def _float(name: str, default: float) -> float:
+    v = os.environ.get(name, "").strip()
+    return float(v) if v else default
+
+
 def _list(name: str, default: str = "") -> list[str]:
     return [x.strip() for x in os.environ.get(name, default).split(",") if x.strip()]
 
@@ -35,6 +40,16 @@ class Settings:
     max_speakers: int = field(default_factory=lambda: _int("AVATAR_MAX_SPEAKERS", 1))
     session_idle_timeout_s: int = field(default_factory=lambda: _int("AVATAR_SESSION_IDLE_TIMEOUT_S", 900))
     idle_loop_seconds: int = field(default_factory=lambda: _int("AVATAR_IDLE_LOOP_SECONDS", 8))
+    # hold the lips at the portrait's closed mouth in the idle loop and gesture clips (blinks / head sway stay)
+    still_mouth_idle: bool = field(default_factory=lambda: os.environ.get("AVATAR_STILL_MOUTH_IDLE", "1") != "0")
+    # pre-render listening gestures per avatar (POST /v1/sessions/{id}/state); 0 = idle loop only
+    gestures: bool = field(default_factory=lambda: os.environ.get("AVATAR_GESTURES", "1") != "0")
+    gesture_clips: list[str] = field(default_factory=lambda: _list("AVATAR_GESTURE_CLIPS", "nod,glance_down,tilt,smile"))
+    gesture_scale: float = field(default_factory=lambda: _float("AVATAR_GESTURE_SCALE", 1.0))
+    # idle frames each clip is rendered from: more = shorter wait / smoother splice, but longer first start
+    gesture_anchors: int = field(default_factory=lambda: _int("AVATAR_GESTURE_ANCHORS", 2))
+    listen_gesture_min_s: float = field(default_factory=lambda: _float("AVATAR_LISTEN_GESTURE_MIN_S", 6.0))
+    listen_gesture_max_s: float = field(default_factory=lambda: _float("AVATAR_LISTEN_GESTURE_MAX_S", 15.0))
     # diffusion steps of Ditto's motion model (online config default: 10)
     sampling_steps: int = field(default_factory=lambda: _int("AVATAR_SAMPLING_STEPS", 10))
     # frames rendered before an utterance's audio is released (stall-free start; ~330 ms on an RTX 3090)

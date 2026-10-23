@@ -6,7 +6,7 @@
 Checks: /health ready; session + offer/answer; ICE connected; idle video arrives at ~25 fps;
 `say` -> utterance_start/utterance_end events; the voice is audible; video keeps ~25 fps while speaking;
 audio and video durations match; a second session is refused while the first speaks (if max_speakers=1);
-`stop` cancels; cleanup. Prints a JSON report; exit code 0 = all checks passed.
+`state` gestures (state_applied event, fps holds, queued while speaking); `stop` cancels; cleanup. Prints a JSON report; exit code 0 = all checks passed.
 """
 from __future__ import annotations
 
@@ -124,10 +124,30 @@ async def main(a) -> int:
             checks["idle_video_25fps"] = report["idle_fps"] >= 23
             report["video_size"] = c.video_size
 
+            # listening gestures: a backchannel nod is spliced into the idle loop (skipped if none were rendered)
+            _, g = await c.api("POST", f"/v1/sessions/{c.sid}/state", {"state": "backchannel"})
+            report["state"] = g
+            if g["clip"]:
+                t_state = time.time()
+                for _ in range(30):
+                    if any(e["type"] == "state_applied" and e["state"] == "backchannel" for e in c.events):
+                        break
+                    await asyncio.sleep(0.1)
+                ev = next((e for e in c.events if e["type"] == "state_applied" and e["state"] == "backchannel"), None)
+                checks["state_applied"] = bool(ev and ev["clip"] == g["clip"])
+                report["state_to_gesture_ms"] = round((ev["t"] - t_state) * 1000) if ev else None
+                await asyncio.sleep(1.5)
+                report["gesture_fps"] = round(c.fps(t_state, time.time()), 1)
+                checks["gesture_video_25fps"] = report["gesture_fps"] >= 23
+            await c.api("POST", f"/v1/sessions/{c.sid}/state", {"state": "listening"})
+
             t_say = time.time()
             _, r = await c.api("POST", f"/v1/sessions/{c.sid}/say", {"text": a.text})
             report["say"] = r
             uid = r["utterance_id"]
+            _, g = await c.api("POST", f"/v1/sessions/{c.sid}/state", {"state": "probe"})
+            if g["clip"]:   # speaking: the gesture waits for the end of the utterance
+                checks["state_queued_while_speaking"] = g["status"] == "queued"
             # a second session must be refused while this one speaks (max_speakers=1)
             if h.get("max_speakers") == 1 and h.get("max_sessions", 1) > 1:
                 c2 = Client(http, a.base, headers)

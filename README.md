@@ -43,8 +43,13 @@ and **even width and height**; 1280×720 works well. Optionally describe them in
 }
 ```
 
-`voice` is passed to the TTS. `emo` is Ditto's emotion class (0–7; 4 is the model's default). The idle loop for each
-avatar is rendered at startup and cached in `<data>/idle/`.
+`voice` is passed to the TTS. `emo` is Ditto's emotion class (0–7; 4 is the model's default). The idle loop and the
+listening gestures for each avatar are rendered at startup and cached in `<data>/idle/`.
+
+**Idle mouth.** Ditto animates a portrait from audio, and even near-silence makes its motion model predict small lip
+movements, so the face looked about to speak. In the idle loop and the gesture clips the lips are held at the
+portrait's own (closed) mouth; blinks and head sway are kept. Speech is not affected. This is why portraits must have
+the mouth closed.
 
 ## API
 
@@ -59,6 +64,7 @@ Every `/v1/*` call needs `Authorization: Bearer <AVATAR_API_TOKEN>` when that va
 | `POST /v1/sessions/{id}/offer` | `{type: "offer", sdp}` | SDP answer. The offer must receive one audio and one video track (`recvonly`), plus optionally a data channel |
 | `POST /v1/sessions/{id}/say` | `{text}` or `{audio_wav_base64}`, `voice?`, `emo?` | `202 {utterance_id, tts_ms, audio_ms, lead_silence_ms}`; `409 busy` if another session is speaking; `409 not_connected` |
 | `POST /v1/sessions/{id}/stop` | | barge-in: cancels everything queued or playing → `{cancelled: [ids]}` |
+| `POST /v1/sessions/{id}/state` | `{state}` | listening body language (below) → `{state, mode, clip, status}`; `400 invalid_state` |
 | `GET /v1/sessions/{id}` | | state + per-utterance timings |
 | `DELETE /v1/sessions/{id}` | | close |
 
@@ -72,7 +78,38 @@ read when a turn starts.
 - `{"type": "utterance_start", "id", "text", "start_ms", "lead_silence_ms", "audio_ms"}` when playback reaches the utterance (its first frame and first audio sample);
 - `{"type": "utterance_end", "id", "cancelled"}` when it has finished (or was stopped).
 
+- `{"type": "state_applied", "state", "clip", "start_ms"?, "skipped"?}` when a `/state` takes visible effect (below).
+
 Use these for captions and turn-taking.
+
+### Listening gestures
+
+`POST /v1/sessions/{id}/state` with `{"state": "<name>"}` tells the avatar what the conversation is doing, so it can
+show some listening body language between utterances. The gestures are short clips pre-rendered per avatar at
+startup, so they cost no GPU time during a session. They never touch speech.
+
+| `state` | effect |
+|---|---|
+| `listening` | idle, plus an occasional `nod` or `glance_down` every 6–15 s (persistent) |
+| `backchannel` | one `nod` ("mm-hm") |
+| `probe` | one head `tilt` |
+| `hint`, `wrap_up` | one small closed-mouth `smile` (a `nod` if `smile` is disabled) |
+| `silent_thinking` | idle, plus an occasional `glance_down` (at notes) every 10–20 s (persistent) |
+| `paused` | idle only, no gestures; drops a pending one (persistent) |
+
+A session starts with no random gestures until the first persistent state. One-shot states don't change the persistent
+one. Clips: `nod` 0.8 s, `glance_down` 1.6 s, `tilt` 1.4 s, `smile` 2.0 s.
+
+- **Response** `status`: `pending` (the clip starts at the next idle frame that matches its first frame, usually within
+  0.5 s, at most ~2 s), `queued` (an utterance is queued or playing: the clip plays after it, or is dropped if that is
+  more than 8 s after the request), `applied` (persistent state set), `unavailable` (gestures disabled).
+- **Speech wins.** A clip never starts while an utterance is queued or playing. If `/say` arrives during a clip, the
+  utterance starts on time and the clip is cut, just as idle is today. A newer one-shot replaces a pending one.
+- **Seamless.** Each clip is a re-render of a stretch of the idle loop itself, with the gesture added on top (head
+  pitch / roll / yaw offsets, eye and smile keypoint offsets). It starts on an idle frame (4-frame cross-fade from the
+  current one) and hands back to the idle loop on exactly the frame it ends on.
+- `state_applied` (data channel) is sent when the clip actually starts (`start_ms` on the media clock), when a
+  persistent state is set, or with `skipped: "stale"` when a queued clip was dropped.
 
 **Sync.** Audio for an utterance is released once 8 frames are pre-rendered (`start_ms` on the shared media clock).
 The video track then always shows the frame that belongs to the audio position: late frames are dropped and missing
@@ -101,6 +138,12 @@ while the mouth is closed is invisible, they start right after their first rende
 | `AVATAR_MAX_SPEAKERS` | `1` | sessions speaking at once (one RTX 3090 sustains one at 25 fps) |
 | `AVATAR_SESSION_IDLE_TIMEOUT_S` | `900` | sessions without API calls are closed |
 | `AVATAR_IDLE_LOOP_SECONDS` | `8` | length of the pre-rendered idle loop (played ping-pong) |
+| `AVATAR_STILL_MOUTH_IDLE` | `1` | hold the lips closed in the idle loop and gesture clips (`0` = Ditto's own idle lip motion) |
+| `AVATAR_GESTURES` | `1` | pre-render listening gestures (`0` = idle loop only; `/state` then answers `unavailable` for clips) |
+| `AVATAR_GESTURE_CLIPS` | `nod,glance_down,tilt,smile` | which clips to render (drop `smile` to use a nod for `hint`/`wrap_up`) |
+| `AVATAR_GESTURE_SCALE` | `1.0` | amplitude of all gestures |
+| `AVATAR_GESTURE_ANCHORS` | `2` | idle frames each clip is rendered from: more = shorter wait and closer splices, ~3–4 s more startup each (once per avatar) |
+| `AVATAR_LISTEN_GESTURE_MIN_S` / `_MAX_S` | `6` / `15` | interval of random gestures in `listening` |
 | `AVATAR_SAMPLING_STEPS` | `10` | Ditto motion-diffusion steps (5 is a little faster, with more startup jitter) |
 | `AVATAR_PREROLL_FRAMES` | `8` | frames rendered before an utterance's audio is released (stall-free start) |
 | `AVATAR_TRIM_LEAD_SILENCE` | `1` | skip all but 120 ms of the leading TTS silence of the first sentence of a turn (sooner first word) |
@@ -122,7 +165,8 @@ Layout:
 
 - `avatar_service/session.py`: the audio/video timeline (pure Python, unit-tested);
 - `media.py`: aiortc tracks;
-- `ditto_engine.py`: the Ditto wrapper;
+- `ditto_engine.py`: the Ditto wrapper (still mouth, re-rendering recorded idle motion for gesture clips);
+- `gestures.py`: gesture clip definitions and the per-session idle director (pure Python, unit-tested);
 - `engines.py`: the native TensorRT builds;
 - `service.py` and `server.py`: sessions and the API.
 

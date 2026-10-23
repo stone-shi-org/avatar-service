@@ -1,0 +1,7 @@
+# Service dependencies (Ditto's own are installed in the Dockerfile).
+aiohttp==3.10.10
+aiortc==1.9.0
+av==12.3.0
+numpy>=1.26
+opencv-python-headless>=4.8
+pytest==8.3.3

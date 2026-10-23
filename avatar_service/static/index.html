@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>avatar-service test page</title>
+<style>
+ body{font:14px system-ui,sans-serif;margin:16px;max-width:900px}
+ video{width:100%;max-width:720px;background:#111;border-radius:8px;display:block}
+ input,select,button{font:inherit;padding:4px 8px} .row{margin:8px 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+ pre{background:#f4f4f4;padding:8px;max-height:260px;overflow:auto;font-size:12px}
+ #meter{width:200px;height:10px;background:#ddd;border-radius:5px;overflow:hidden} #meter>div{height:100%;background:#2a7;width:0}
+</style></head><body>
+<h3>avatar-service</h3>
+<div class="row">
+  <select id="avatar"></select>
+  <input id="token" placeholder="API token (if set)" size="22">
+  <button id="connect">Connect</button><span id="status">disconnected</span>
+</div>
+<video id="v" autoplay playsinline></video>
+<audio id="a" autoplay></audio>
+<div class="row"><input id="text" size="70" value="Thanks for joining today. Let's start with a quick introduction.">
+  <button id="say" disabled>Say</button><button id="stop" disabled>Stop</button>
+  <span>voice level</span><div id="meter"><div></div></div></div>
+<pre id="log"></pre>
+<script>
+// Exposed for automated tests: window.avatarTest = { ready, events: [], utterances: [] }
+const $ = (id) => document.getElementById(id);
+const log = (...m) => { $('log').textContent = m.join(' ') + '\n' + $('log').textContent; };
+const T = window.avatarTest = { ready: false, events: [], utterances: [], errors: [] };
+let sid = null, pc = null, ctx = null, analyser = null, pending = {};
+const hdr = () => ({ 'Content-Type': 'application/json', ...($('token').value ? { Authorization: 'Bearer ' + $('token').value } : {}) });
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: hdr(), body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`${r.status} ${j.error ? j.error.code + ': ' + j.error.message : ''}`);
+  return j;
+}
+(async () => {
+  try { const j = await api('GET', '/v1/avatars'); for (const a of j.avatars) $('avatar').add(new Option(`${a.name} (${a.voice})`, a.id)); }
+  catch (e) { log('avatars:', e.message); }
+})();
+async function connect(avatar) {
+  const s = await api('POST', '/v1/sessions', { avatar: avatar || $('avatar').value || undefined });
+  sid = s.session_id; log('session', sid, JSON.stringify(s.frame_size));
+  pc = new RTCPeerConnection({ iceServers: (s.ice_servers || []).map((u) => ({ urls: u })) });
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  const ch = pc.createDataChannel('events');
+  ch.onmessage = (m) => {
+    const e = JSON.parse(m.data); e.at = performance.now(); T.events.push(e); log('event', m.data);
+    const p = pending[e.id]; if (p && e.type === 'utterance_start') p.start_event_ms = Math.round(e.at - p.t_say);
+  };
+  pc.ontrack = (e) => {
+    if (e.track.kind === 'video') $('v').srcObject = e.streams[0];
+    if (e.track.kind === 'audio') {
+      $('a').srcObject = new MediaStream([e.track]);   // Chrome only feeds WebAudio while a media element plays it
+      ctx = new AudioContext();
+      analyser = ctx.createAnalyser(); analyser.fftSize = 512;
+      ctx.createMediaStreamSource(new MediaStream([e.track])).connect(analyser);  // the echo-cancel reference path
+      watchAudio();
+    }
+    T.streams = [...new Set([...(T.streams || []), e.streams[0].id])];
+  };
+  pc.onconnectionstatechange = () => { $('status').textContent = pc.connectionState; if (pc.connectionState === 'connected') { T.ready = true; $('say').disabled = $('stop').disabled = false; } };
+  await pc.setLocalDescription(await pc.createOffer());
+  await new Promise((r) => { if (pc.iceGatheringState === 'complete') r(); pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); setTimeout(r, 3000); });
+  await pc.setRemoteDescription(await api('POST', `/v1/sessions/${sid}/offer`, pc.localDescription));
+}
+function watchAudio() {
+  const buf = new Float32Array(512); let on = false, quiet = 0;
+  setInterval(() => {
+    analyser.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x;
+    const rms = Math.sqrt(s / buf.length), now = performance.now();
+    $('meter').firstChild.style.width = Math.min(100, rms * 400) + '%';
+    if (!on && rms > 0.02) { on = true; const p = Object.values(pending).find((u) => !u.voice_ms); if (p) { p.voice_ms = Math.round(now - p.t_say); T.utterances.push(p); log('heard', JSON.stringify(p)); } }
+    if (rms < 0.005) { quiet = quiet || now; if (now - quiet > 400) on = false; } else quiet = 0;
+  }, 5);
+}
+window.say = async (text) => {
+  ctx && ctx.resume();
+  const t_say = performance.now();
+  const r = await api('POST', `/v1/sessions/${sid}/say`, { text });
+  pending[r.utterance_id] = { id: r.utterance_id, text, t_say, tts_ms: r.tts_ms, lead_silence_ms: r.lead_silence_ms, audio_ms: r.audio_ms };
+  return r;
+};
+window.stopSpeaking = () => api('POST', `/v1/sessions/${sid}/stop`);
+window.connectAvatar = connect;
+window.stats = async () => {
+  const out = {}; (await pc.getStats()).forEach((r) => { if (r.type === 'inbound-rtp') out[r.kind] = { fps: r.framesPerSecond, dropped: r.framesDropped, decoded: r.framesDecoded, width: r.frameWidth, height: r.frameHeight, jitter_buffer_ms: Math.round(1000 * r.jitterBufferDelay / Math.max(1, r.jitterBufferEmittedCount)) }; });
+  return out;
+};
+$('connect').onclick = () => connect().catch((e) => { T.errors.push(e.message); log('error', e.message); });
+$('say').onclick = () => window.say($('text').value).catch((e) => log('error', e.message));
+$('stop').onclick = () => window.stopSpeaking().then((r) => log('stopped', JSON.stringify(r)));
+</script></body></html>

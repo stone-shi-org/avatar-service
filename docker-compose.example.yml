@@ -1,0 +1,23 @@
+# Example deployment. Copy to docker-compose.yml and adjust paths / TTS URL.
+services:
+  avatar:
+    image: avatar:latest            # or <your-registry>/avatar:latest
+    container_name: avatar
+    # WebRTC media is UDP to ports chosen at runtime; with bridge networking the container would
+    # advertise unreachable ICE candidates. Host networking keeps it working on a LAN with no TURN.
+    network_mode: host
+    environment:
+      - AVATAR_PORT=4040
+      - AVATAR_TTS_URL=http://localhost:4031      # live-stt (Kokoro) or any OpenAI-compatible /v1/audio/speech
+      # - AVATAR_API_TOKEN=change-me
+    volumes:
+      - ./models:/models:ro          # scripts/download_models.sh ./models  + portraits in ./models/avatars/
+      - ./data:/data                 # GPU-specific TensorRT engines + idle loops (created on first start)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

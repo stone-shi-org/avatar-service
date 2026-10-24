@@ -142,7 +142,7 @@ while the mouth is closed is invisible, they start right after their first rende
 | `AVATAR_GESTURES` | `1` | pre-render listening gestures (`0` = idle loop only; `/state` then answers `unavailable` for clips) |
 | `AVATAR_GESTURE_CLIPS` | `nod,glance_down,tilt,smile` | which clips to render (drop `smile` to use a nod for `hint`/`wrap_up`) |
 | `AVATAR_GESTURE_SCALE` | `1.0` | amplitude of all gestures |
-| `AVATAR_GESTURE_ANCHORS` | `2` | idle frames each clip is rendered from: more = shorter wait and closer splices, ~3–4 s more startup each (once per avatar) |
+| `AVATAR_GESTURE_ANCHORS` | `2` | idle frames each clip is rendered from: more = shorter wait and closer splices; each adds ~145 frames (~5–6 s on an RTX 3090, estimated) to the first start per avatar |
 | `AVATAR_LISTEN_GESTURE_MIN_S` / `_MAX_S` | `6` / `15` | interval of random gestures in `listening` |
 | `AVATAR_SAMPLING_STEPS` | `10` | Ditto motion-diffusion steps (5 is a little faster, with more startup jitter) |
 | `AVATAR_PREROLL_FRAMES` | `8` | frames rendered before an utterance's audio is released (stall-free start) |

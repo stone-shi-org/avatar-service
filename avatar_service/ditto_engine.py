@@ -121,6 +121,7 @@ class TurnFeed:
         self.items: list = []
         self.closed = False
         self.cancelled = False
+        self.taken = 0      # items handed out by `next` (a consumer in another process checks it, see worker.py)
 
     def put(self, item) -> bool:
         with self.cond:
@@ -134,13 +135,23 @@ class TurnFeed:
         with self.cond:
             if not self.items and timeout > 0 and not self.cancelled:
                 self.cond.wait(timeout)
-            return self.items.pop(0) if self.items and not self.cancelled else None
+            if not self.items or self.cancelled:
+                return None
+            self.taken += 1
+            return self.items.pop(0)
 
     def close_if_empty(self) -> bool:
         with self.cond:
             if not self.items or self.cancelled:
                 self.closed = True
             return self.closed
+
+    def close_if_drained(self, received: int) -> bool:
+        """`close_if_empty` for a remote consumer that has received `received` items: False while one is in flight."""
+        with self.cond:
+            if self.taken > received and not self.cancelled:
+                return False
+            return self.close_if_empty()
 
     def cancel(self) -> list:
         with self.cond:
@@ -215,6 +226,10 @@ class DittoRenderer:
         finally:
             sdk.close()
         return count[0]
+
+    def warm(self, avatar: Avatar) -> None:
+        """One short render: the first one after loading also sets up the TensorRT contexts."""
+        self.render(avatar, np.zeros(DITTO_SR, np.float32), lambda f: None)
 
     def stream(self, avatar: Avatar, feed: TurnFeed, on_segment: Callable[[object, int, int], None],
                on_frame: Callable[[int, np.ndarray], None], emo: int | None = None, linger_s: float = 1.0) -> None:
@@ -363,6 +378,9 @@ class FakeRenderer:
             on_frame(f)
             time.sleep(0.004)
         return n
+
+    def warm(self, avatar) -> None:
+        self.render(avatar, np.zeros(DITTO_SR, np.float32), lambda f: None)
 
     def stream(self, avatar, feed, on_segment, on_frame, emo=None, linger_s: float = 1.0) -> None:
         with self.lock:

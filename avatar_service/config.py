@@ -60,6 +60,9 @@ class Settings:
     max_audio_seconds: int = field(default_factory=lambda: _int("AVATAR_MAX_AUDIO_SECONDS", 30))
     # optional STUN/TURN for clients outside the LAN, e.g. "stun:stun.l.google.com:19302"
     ice_servers: list[str] = field(default_factory=lambda: _list("AVATAR_ICE_SERVERS"))
+    # free the GPU after this many seconds without speech: the renderer then runs in a child process that is stopped
+    # when idle and started again (~4 s) by the next turn, or earlier when a client connects; 0 = keep it loaded
+    model_idle_unload_s: int = field(default_factory=lambda: _int("AVATAR_MODEL_IDLE_UNLOAD_S", 0))
     # skip GPU work entirely (API / unit tests only)
     fake_renderer: bool = field(default_factory=lambda: os.environ.get("AVATAR_FAKE_RENDERER", "") == "1")
 

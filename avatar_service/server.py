@@ -200,6 +200,7 @@ def build_app(settings: Settings | None = None, service: AvatarService | None = 
     async def on_cleanup(app):
         for sid in list(app[SVC].sessions):
             await app[SVC].close_session(sid)
+        app[SVC].shutdown()
         await app[HTTP].close()
 
     app.on_startup.append(on_startup)

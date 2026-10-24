@@ -11,7 +11,7 @@ It was built as the "photoreal interviewer" for a mock-interview app, but it kno
 - **Measured on an RTX 3090** with an STT and TTS model on the same card:
   - 25–30 fps at 1280×720;
   - about 330 ms (p95 about 400 ms) from audio to stall-free video;
-  - about 3 GB of VRAM.
+  - about 3 GB of VRAM, which can be freed while nobody is speaking (see [Freeing the GPU when idle](#freeing-the-gpu-when-idle)).
 - **One speaking session per GPU.** A second session asking to speak gets `409 busy`, so clients can fall back to
   something cheaper. Any number of connected but silent sessions is fine (idle frames cost no GPU).
 - **Engines rebuilt per GPU.** Ditto's shipped "Ampere+" engines are about 20 % slower. On first start the service
@@ -58,7 +58,7 @@ Every `/v1/*` call needs `Authorization: Bearer <AVATAR_API_TOKEN>` when that va
 
 | Method & path | Body | Result |
 |---|---|---|
-| `GET /health` | | `200` when ready, `503` while starting (`status`: `building_engines`, `loading`, `warming_up`, `error`) |
+| `GET /health` | | `200` when ready, `503` while starting (`status`: `building_engines`, `loading`, `warming_up`, `error`); `model.state`: `loaded`, `unloaded`, `loading` |
 | `GET /v1/avatars` | | `{avatars: [{id, name, voice, emo, image}]}` |
 | `POST /v1/sessions` | `{avatar?, voice?}` | `201 {session_id, avatar, voice, frame_size, ice_servers}`; `429` if `AVATAR_MAX_SESSIONS` is reached |
 | `POST /v1/sessions/{id}/offer` | `{type: "offer", sdp}` | SDP answer. The offer must receive one audio and one video track (`recvonly`), plus optionally a data channel |
@@ -79,6 +79,8 @@ read when a turn starts.
 - `{"type": "utterance_end", "id", "cancelled"}` when it has finished (or was stopped).
 
 - `{"type": "state_applied", "state", "clip", "start_ms"?, "skipped"?}` when a `/state` takes visible effect (below).
+- `{"type": "model_loading"}` when a turn has to load the renderer first (only with `AVATAR_MODEL_IDLE_UNLOAD_S`): its
+  speech starts about 5 s later than usual.
 
 Use these for captions and turn-taking.
 
@@ -125,6 +127,23 @@ while the mouth is closed is invisible, they start right after their first rende
 - `network_mode: host` (or a TURN server, via `AVATAR_ICE_SERVERS`) is needed for media to reach browsers. Bridge
   networking advertises container-internal ICE candidates.
 
+## Freeing the GPU when idle
+
+With `AVATAR_MODEL_IDLE_UNLOAD_S=300`, the renderer runs in a child process that is stopped after 300 s without
+speech. That frees all of its ~3 GB of VRAM; the main process never touches CUDA. Sessions stay connected and keep
+playing the idle loop and gestures, which are pre-rendered and need no GPU.
+
+The renderer is started again:
+
+- when a session is created or calls `/state` (speech is probably coming soon): ~4 s in the background, usually
+  done before the first `/say`;
+- otherwise by the turn that needs it. That turn waits ~5 s (measured on an RTX 3090) and the client gets a
+  `model_loading` event first.
+
+On an RTX 3090 the child process costs no measurable latency or frame rate (first frame 431–447 ms in the child
+vs 433–495 ms in-process, 25 fps both). A crashed renderer is replaced by the next turn. `/health` shows `model`:
+`state`, `pid`, `idle_s` and `loads`. With `0` (the default) the renderer stays loaded in the main process, as before.
+
 ## Configuration
 
 | Variable | Default | |
@@ -137,6 +156,7 @@ while the mouth is closed is invisible, they start right after their first rende
 | `AVATAR_MAX_SESSIONS` | `4` | connected sessions |
 | `AVATAR_MAX_SPEAKERS` | `1` | sessions speaking at once (one RTX 3090 sustains one at 25 fps) |
 | `AVATAR_SESSION_IDLE_TIMEOUT_S` | `900` | sessions without API calls are closed |
+| `AVATAR_MODEL_IDLE_UNLOAD_S` | `0` | free the renderer's VRAM after this many seconds without speech; reloads on demand (~5 s). `0` = stay loaded |
 | `AVATAR_IDLE_LOOP_SECONDS` | `8` | length of the pre-rendered idle loop (played ping-pong) |
 | `AVATAR_STILL_MOUTH_IDLE` | `1` | hold the lips closed in the idle loop and gesture clips (`0` = Ditto's own idle lip motion) |
 | `AVATAR_GESTURES` | `1` | pre-render listening gestures (`0` = idle loop only; `/state` then answers `unavailable` for clips) |
@@ -168,6 +188,7 @@ Layout:
 - `ditto_engine.py`: the Ditto wrapper (still mouth, re-rendering recorded idle motion for gesture clips);
 - `gestures.py`: gesture clip definitions and the per-session idle director (pure Python, unit-tested);
 - `engines.py`: the native TensorRT builds;
+- `worker.py`: the renderer in a child process, started on demand and stopped when idle;
 - `service.py` and `server.py`: sessions and the API.
 
 ## Licenses

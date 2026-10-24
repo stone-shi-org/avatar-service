@@ -148,9 +148,29 @@ class AvatarService:
         self.loop = loop
         threading.Thread(target=self._init, name="avatar-init", daemon=True).start()
 
+    def _worker_cfg(self) -> dict:
+        return {"fake": self.s.fake_renderer, "ditto_dir": self.s.ditto_dir, "ditto_models": self.s.ditto_models,
+                "data_dir": self.s.data_dir, "sampling_steps": self.s.sampling_steps,
+                "native": os.environ.get("AVATAR_NATIVE_ENGINES", "1") != "0",
+                "log_level": os.environ.get("AVATAR_LOG_LEVEL", "INFO")}
+
+    @property
+    def on_demand(self) -> bool:
+        return self.s.model_idle_unload_s > 0
+
+    def _on_model_state(self, state: str) -> None:
+        if self.state in ("starting", "building_engines", "loading") and state in ("building_engines", "loading"):
+            self.state = state      # startup progress on /health
+
     def _init(self) -> None:
         try:
-            if self.s.fake_renderer:
+            if self.on_demand:
+                # renderer in a child process (worker.py), stopped after model_idle_unload_s without speech
+                from .worker import OnDemandRenderer
+                self.renderer = OnDemandRenderer(self._worker_cfg(), self.s.model_idle_unload_s, self._on_model_state)
+                self.renderer.load()
+                self.gpu, self.engines_dir = self.renderer.gpu, self.renderer.engines
+            elif self.s.fake_renderer:
                 from .ditto_engine import FakeRenderer
                 self.renderer, self.gpu = FakeRenderer(), "fake"
             else:
@@ -174,8 +194,7 @@ class AvatarService:
                              time.time() - t, len(assets.frames),
                              {k: assets.clip_len(k) for k in assets.clips}, assets.anchors)
             if self.catalog:  # first real render also warms the TensorRT contexts
-                av = next(iter(self.catalog.values()))
-                self.renderer.render(av, np.zeros(DITTO_SR, np.float32), lambda f: None)
+                self.renderer.warm(next(iter(self.catalog.values())))
             self.state = "ready"
             log.info("ready: %d avatar(s) %s, gpu=%s", len(self.catalog), list(self.catalog), self.gpu)
         except Exception as e:  # noqa: BLE001 - surfaced on /health
@@ -186,7 +205,24 @@ class AvatarService:
         return {"status": self.state, "error": self.error, "gpu": self.gpu, "engines": self.engines_dir,
                 "avatars": list(self.catalog), "sessions": len(self.sessions),
                 "speaking": sum(1 for x in self.sessions.values() if x.timeline.busy),
-                "max_sessions": self.s.max_sessions, "max_speakers": self.s.max_speakers}
+                "max_sessions": self.s.max_sessions, "max_speakers": self.s.max_speakers,
+                "model": self._model_status()}
+
+    def _model_status(self) -> dict:
+        r = self.renderer
+        if not self.on_demand or r is None:
+            return {"state": "loaded" if r is not None else "unloaded", "idle_unload_s": 0}
+        return {"state": r.state, "idle_unload_s": self.s.model_idle_unload_s, "pid": r.proc.pid if r.proc else None,
+                "idle_s": round(time.time() - r.last_used, 1), "loads": r.loads, "error": r.error}
+
+    def preload(self, sess: Optional[Session] = None) -> None:
+        """A client is about to need the renderer: start it now if it was unloaded (no-op when loaded)."""
+        if self.on_demand and self.state == "ready":
+            self.renderer.preload(sess.avatar if sess else None)
+
+    def shutdown(self) -> None:
+        if self.on_demand and self.renderer is not None:
+            self.renderer.close()
 
     def require_ready(self) -> None:
         if self.state != "ready":
@@ -212,6 +248,7 @@ class AvatarService:
                                  on_event=lambda e, s=sess: self._send_event(s, e),
                                  listen_interval=(self.s.listen_gesture_min_s, self.s.listen_gesture_max_s))
         self.sessions[sid] = sess
+        self.preload(sess)
         return sess
 
     def get(self, sid: str) -> Session:
@@ -250,6 +287,7 @@ class AvatarService:
         """Client behaviour state -> idle gesture (see gestures.ONE_SHOT / MODES). Never touches speech."""
         if not isinstance(state, str) or state not in STATES:
             raise ServiceError(400, "invalid_state", f"state must be one of {list(STATES)}")
+        self.preload(sess)       # the client reports conversation state: an answer is likely coming
         return sess.director.set_state(state)
 
     # ---------- speaking ----------
@@ -308,6 +346,9 @@ class AvatarService:
         try:
             if feed.cancelled:
                 return
+            if self.on_demand and not self.renderer.loaded:
+                log.info("session %s: renderer unloaded, loading it for this turn", sess.id)
+                loop.call_soon_threadsafe(self._send_event, sess, {"type": "model_loading"})
             self.renderer.stream(sess.avatar, feed, on_segment, on_frame, emo=emo)
         except Exception:  # noqa: BLE001
             log.exception("render stream failed for session %s", sess.id)

@@ -10,6 +10,7 @@ services:
       - AVATAR_PORT=4040
       - AVATAR_TTS_URL=http://localhost:4031      # live-stt (Kokoro) or any OpenAI-compatible /v1/audio/speech
       # - AVATAR_API_TOKEN=change-me
+      # - AVATAR_MODEL_IDLE_UNLOAD_S=300           # free the ~3 GB of VRAM after 5 min without speech
     volumes:
       - ./models:/models:ro          # scripts/download_models.sh ./models  + portraits in ./models/avatars/
       - ./data:/data                 # GPU-specific TensorRT engines + idle loops (created on first start)

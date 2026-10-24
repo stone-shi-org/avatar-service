@@ -35,7 +35,7 @@ async def fake_tts(request):
     return web.Response(body=encode_wav(x, 24000), content_type="audio/wav")
 
 
-async def run(tmp_path, token):
+async def run(tmp_path, token, unload_s=0):
     av = tmp_path / "models" / "avatars"
     av.mkdir(parents=True)
     cv2.imwrite(str(av / "alexa.png"), np.full((360, 640, 3), 120, np.uint8))
@@ -49,6 +49,7 @@ async def run(tmp_path, token):
     s = Settings()
     s.models_dir, s.data_dir = str(tmp_path / "models"), str(tmp_path / "data")
     s.tts_url, s.fake_renderer, s.api_token, s.max_sessions = f"http://127.0.0.1:{tts_port}", True, token, 3
+    s.model_idle_unload_s = unload_s
     runner = web.AppRunner(build_app(s))
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", port).start()
@@ -64,6 +65,13 @@ async def run(tmp_path, token):
 
 def test_end_to_end_with_fake_renderer(tmp_path, capsys):
     rc = asyncio.run(run(tmp_path, token="t0ken"))
+    out = capsys.readouterr().out
+    assert rc == 0, out
+
+
+def test_end_to_end_with_on_demand_renderer(tmp_path, capsys):
+    """Same, with the (fake) renderer in a child process that is stopped after 1 s idle and restarted per turn."""
+    rc = asyncio.run(run(tmp_path, token="t0ken", unload_s=1))
     out = capsys.readouterr().out
     assert rc == 0, out
 

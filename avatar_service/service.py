@@ -193,8 +193,25 @@ class AvatarService:
                     log.info("idle loop for %s rendered in %.1f s (%d frames; clips %s at anchors %s)", av.id,
                              time.time() - t, len(assets.frames),
                              {k: assets.clip_len(k) for k in assets.clips}, assets.anchors)
-            if self.catalog:  # first real render also warms the TensorRT contexts
-                self.renderer.warm(next(iter(self.catalog.values())))
+            if self.catalog:  # first real render also warms the TensorRT contexts for all avatars
+                for av in self.catalog.values():
+                    t_w = time.time()
+                    self.renderer.warm(av)
+                    log.info("warmup render for avatar %s complete in %.2f s", av.id, time.time() - t_w)
+            if self.s.tts_url:
+                import urllib.request, json
+                voices = {av.voice for av in self.catalog.values() if av.voice}
+                for v in sorted(voices):
+                    try:
+                        req = urllib.request.Request(
+                            f"{self.s.tts_url.rstrip('/')}/v1/audio/speech",
+                            data=json.dumps({"model": self.s.tts_model, "voice": v, "input": "."}).encode(),
+                            headers={"Content-Type": "application/json"},
+                        )
+                        urllib.request.urlopen(req, timeout=5)
+                        log.info("warmed TTS voice %s", v)
+                    except Exception as e:
+                        log.warning("could not warm TTS voice %s: %s", v, e)
             self.state = "ready"
             log.info("ready: %d avatar(s) %s, gpu=%s", len(self.catalog), list(self.catalog), self.gpu)
         except Exception as e:  # noqa: BLE001 - surfaced on /health

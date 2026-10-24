@@ -87,6 +87,30 @@ async def create_session(request):
     return web.json_response({**sess.public(), "ice_servers": svc.s.ice_servers}, status=201)
 
 
+async def _optional_json(request: web.Request) -> dict:
+    """A JSON object body, or {} when there is no (or an empty) body."""
+    if not request.can_read_body or not (await request.read()).strip():
+        return {}
+    return await _json(request)
+
+
+async def warmup(request):
+    body = await _optional_json(request)
+    avatar, voice = body.get("avatar"), body.get("voice")
+    for k, v in (("avatar", avatar), ("voice", voice)):
+        if v is not None and not isinstance(v, str):
+            raise ServiceError(400, f"invalid_{k}", f"{k} must be a string")
+    return web.json_response(await request.app[SVC].warmup(avatar or None, voice or None))
+
+
+async def cooldown(request):
+    body = await _optional_json(request)
+    force = body.get("force", False)
+    if not isinstance(force, bool):
+        raise ServiceError(400, "invalid_force", "force must be a boolean")
+    return web.json_response(await request.app[SVC].cooldown(force))
+
+
 async def get_session(request):
     return web.json_response(request.app[SVC].get(request.match_info["sid"]).public())
 
@@ -195,6 +219,7 @@ def build_app(settings: Settings | None = None, service: AvatarService | None = 
     async def on_startup(app):
         import asyncio
         app[HTTP] = aiohttp.ClientSession()
+        app[SVC].http = app[HTTP]
         app[SVC].start(asyncio.get_running_loop())
 
     async def on_cleanup(app):
@@ -211,5 +236,6 @@ def build_app(settings: Settings | None = None, service: AvatarService | None = 
         web.delete("/v1/sessions/{sid}", delete_session), web.post("/v1/sessions/{sid}/offer", offer),
         web.post("/v1/sessions/{sid}/say", say), web.post("/v1/sessions/{sid}/stop", stop),
         web.post("/v1/sessions/{sid}/state", set_state),
+        web.post("/v1/warmup", warmup), web.post("/v1/cooldown", cooldown),
     ])
     return app

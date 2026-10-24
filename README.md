@@ -67,6 +67,8 @@ Every `/v1/*` call needs `Authorization: Bearer <AVATAR_API_TOKEN>` when that va
 | `POST /v1/sessions/{id}/state` | `{state}` | listening body language (below) → `{state, mode, clip, status}`; `400 invalid_state` |
 | `GET /v1/sessions/{id}` | | state + per-utterance timings |
 | `DELETE /v1/sessions/{id}` | | close |
+| `POST /v1/warmup` | `{avatar?, voice?}` (body optional) | loads the renderer if unloaded, renders the avatar once (all avatars if none is warm yet) and probes the TTS voice (skipped if probed < 60 s ago) → `{ok, status, avatar, voice, warmed_avatars, renderer_busy, tts_warmed, model}`; `404 unknown_avatar`. A TTS failure only gives `tts_warmed: false` |
+| `POST /v1/cooldown` | `{force?}` (body optional) | frees the GPU now (on-demand mode) → `{ok, unloaded, sessions, model, reason?}`. With open sessions it does nothing (`reason: active_sessions`) unless `force: true`, which closes them first. With `AVATAR_MODEL_IDLE_UNLOAD_S=0`: `reason: persistent_mode` |
 
 **Sentences** posted one after another are queued and play back to back. All sentences of a turn go through one
 continuous Ditto stream, so only the first pays the renderer's start-up (about 430 ms to the first frame on an
@@ -135,6 +137,7 @@ playing the idle loop and gestures, which are pre-rendered and need no GPU.
 
 The renderer is started again:
 
+- by `POST /v1/warmup`, which waits until it is loaded and warm (call it before an interview starts);
 - when a session is created or calls `/state` (speech is probably coming soon): ~4 s in the background, usually
   done before the first `/say`;
 - otherwise by the turn that needs it. That turn waits ~5 s (measured on an RTX 3090) and the client gets a
@@ -143,6 +146,10 @@ The renderer is started again:
 On an RTX 3090 the child process costs no measurable latency or frame rate (first frame 431–447 ms in the child
 vs 433–495 ms in-process, 25 fps both). A crashed renderer is replaced by the next turn. `/health` shows `model`:
 `state`, `pid`, `idle_s` and `loads`. With `0` (the default) the renderer stays loaded in the main process, as before.
+
+`POST /v1/cooldown` stops the renderer right away instead of waiting for the timeout (e.g. when an interview ends).
+Creating a session also probes its TTS voice in the background (at most once a minute per voice), so a TTS server that
+evicted its model while idle (live-stt unloads Kokoro after 10 min) is loading again before the first `/say`.
 
 ## Configuration
 

@@ -142,6 +142,10 @@ class AvatarService:
         self.sessions: dict[str, Session] = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="render")
         self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.http = None                                # aiohttp.ClientSession, set by the server on startup
+        self._warmed_avatars: set[str] = set()          # avatar ids rendered once since the renderer (re)loaded
+        self._tts_warmed_at: dict[str, float] = {}      # voice -> time of the last successful TTS probe
+        self._tts_warming: dict[str, asyncio.Future] = {}  # voice -> probe in flight
 
     # ---------- startup ----------
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -159,6 +163,8 @@ class AvatarService:
         return self.s.model_idle_unload_s > 0
 
     def _on_model_state(self, state: str) -> None:
+        if state == "unloaded":
+            self._warmed_avatars.clear()   # a reloaded renderer has cold TensorRT contexts again
         if self.state in ("starting", "building_engines", "loading") and state in ("building_engines", "loading"):
             self.state = state      # startup progress on /health
 
@@ -197,6 +203,7 @@ class AvatarService:
                 for av in self.catalog.values():
                     t_w = time.time()
                     self.renderer.warm(av)
+                    self._warmed_avatars.add(av.id)
                     log.info("warmup render for avatar %s complete in %.2f s", av.id, time.time() - t_w)
             if self.s.tts_url:
                 import urllib.request, json
@@ -209,6 +216,7 @@ class AvatarService:
                             headers={"Content-Type": "application/json"},
                         )
                         urllib.request.urlopen(req, timeout=5)
+                        self._tts_warmed_at[v] = time.time()
                         log.info("warmed TTS voice %s", v)
                     except Exception as e:
                         log.warning("could not warm TTS voice %s: %s", v, e)
@@ -266,6 +274,10 @@ class AvatarService:
                                  listen_interval=(self.s.listen_gesture_min_s, self.s.listen_gesture_max_s))
         self.sessions[sid] = sess
         self.preload(sess)
+        if self._tts_needs_warm(sess.voice) and self.loop is not None:
+            # fire and forget: wakes the TTS server (live-stt-2 evicts Kokoro after 10 min idle) while the
+            # client is still negotiating WebRTC, so the first /say doesn't pay for the model load
+            self.loop.create_task(self.warm_tts(sess.voice))
         return sess
 
     def get(self, sid: str) -> Session:
@@ -298,6 +310,98 @@ class AvatarService:
         if ch is not None and getattr(ch, "readyState", "") == "open":
             import json
             ch.send(json.dumps(event))
+
+    # ---------- warmup / cooldown ----------
+    TTS_WARM_TTL_S = 60.0
+
+    def _tts_needs_warm(self, voice: str) -> bool:
+        return bool(self.s.tts_url) and time.time() - self._tts_warmed_at.get(voice, 0.0) > self.TTS_WARM_TTL_S
+
+    async def warm_tts(self, voice: str) -> bool:
+        """Synthesize a tiny probe with `voice` unless that succeeded within TTS_WARM_TTL_S. Never raises."""
+        if not self.s.tts_url:
+            return False
+        if not self._tts_needs_warm(voice):
+            return True
+        fut = self._tts_warming.get(voice)
+        if fut is None:                   # one probe per voice at a time; concurrent callers share it
+            fut = self._tts_warming[voice] = asyncio.ensure_future(self._probe_tts(voice))
+            fut.add_done_callback(lambda _f, v=voice: self._tts_warming.pop(v, None))
+        return await asyncio.shield(fut)
+
+    async def _probe_tts(self, voice: str) -> bool:
+        from .audio import AudioError
+        from .tts import TtsError, synthesize
+
+        own = self.http is None
+        http = self.http
+        if own:
+            import aiohttp
+            http = aiohttp.ClientSession()
+        try:
+            _, _, ms = await synthesize(http, self.s.tts_url, self.s.tts_model, voice, ".", self.s.tts_timeout_s)
+            self._tts_warmed_at[voice] = time.time()
+            log.info("warmed TTS voice %s in %d ms", voice, ms)
+            return True
+        except (TtsError, AudioError, asyncio.TimeoutError) as e:
+            log.warning("could not warm TTS voice %s: %s", voice, e)
+            return False
+        except Exception:  # noqa: BLE001 - warming is best effort
+            log.exception("could not warm TTS voice %s", voice)
+            return False
+        finally:
+            if own:
+                await http.close()
+
+    async def warmup(self, avatar_id: Optional[str], voice: Optional[str]) -> dict:
+        """Make sure the renderer and the TTS voice are loaded and warm, e.g. right before an interview."""
+        self.require_ready()
+        if not self.catalog:
+            raise ServiceError(500, "no_avatars", "no avatars on the model volume")
+        if avatar_id is not None:
+            av = self.catalog.get(avatar_id)
+            if av is None:
+                raise ServiceError(404, "unknown_avatar", f"unknown avatar {avatar_id!r}; have {list(self.catalog)}")
+            targets = [av]
+        else:
+            av = next(iter(self.catalog.values()))
+            targets = [av] if self._warmed_avatars else list(self.catalog.values())
+        voice = voice or av.voice
+        tts = asyncio.ensure_future(self.warm_tts(voice))   # concurrently with the render
+
+        busy = any(x.timeline.busy for x in self.sessions.values())   # a turn is rendering: it's warm anyway
+        warmed: list[str] = []
+        if not busy:
+            loop = asyncio.get_running_loop()
+            for a in targets:
+                if self.on_demand or a.id not in self._warmed_avatars:
+                    # on demand, renderer.warm() first (re)starts the child process if it was unloaded
+                    await loop.run_in_executor(self.pool, self.renderer.warm, a)
+                    self._warmed_avatars.add(a.id)
+                    warmed.append(a.id)
+        return {"ok": True, "status": self.state, "avatar": av.id, "voice": voice, "warmed_avatars": warmed,
+                "renderer_busy": busy, "tts_warmed": await tts, "model": self._model_status()}
+
+    async def cooldown(self, force: bool = False) -> dict:
+        """Free the GPU now (on-demand mode) instead of waiting for the idle timeout."""
+        if self.sessions and not force:
+            return {"ok": True, "unloaded": False, "reason": "active_sessions", "sessions": len(self.sessions),
+                    "model": self._model_status()}
+        for sid in list(self.sessions):
+            try:
+                await self.close_session(sid)
+            except ServiceError:
+                pass                       # closed concurrently
+        if not self.on_demand:
+            return {"ok": True, "unloaded": False, "reason": "persistent_mode", "sessions": len(self.sessions),
+                    "model": self._model_status()}
+        if self.renderer is None or not hasattr(self.renderer, "unload"):
+            return {"ok": True, "unloaded": False, "reason": "not_loaded", "sessions": len(self.sessions),
+                    "model": self._model_status()}
+        # in the render pool, so it queues behind a turn still winding down after close_session
+        unloaded = await asyncio.get_running_loop().run_in_executor(self.pool, self.renderer.unload)
+        self._warmed_avatars.clear()
+        return {"ok": True, "unloaded": bool(unloaded), "sessions": len(self.sessions), "model": self._model_status()}
 
     # ---------- listening gestures ----------
     def set_state(self, sess: Session, state: object) -> dict:
